@@ -451,35 +451,34 @@ describe("runClarg (error paths)", () => {
 
 });
 
-// ── extension factory — toggle command ────────────────────────────────────
+// ── extension factory — toggle commands ──────────────────────────────────
 
-describe("extension factory — /clarg toggle", () => {
+describe("extension factory — /clarg-on /clarg-off", () => {
   let pi: ExtensionAPI;
   let notifyCalls: Array<{ msg: string; level: string }>;
   let toolCallHandlers: Array<(...args: any[]) => any>;
+  let commands: Map<string, (args: string, ctx: any) => Promise<void>>;
 
   beforeEach(() => {
     resetState();
     notifyCalls = [];
     toolCallHandlers = [];
+    commands = new Map();
     pi = {
-      registerCommand: vi.fn((_name: string, opts: any) => {
-        // Store command handler for later invocation
-        (pi as any)._commandHandler = opts.handler;
+      registerCommand: vi.fn((name: string, opts: any) => {
+        commands.set(name, opts.handler);
       }),
       on: vi.fn((event: string, handler: any) => {
         if (event === "tool_call") {
           toolCallHandlers.push(handler);
         }
       }),
-      notify: undefined as any, // filled by mock ctx
     } as unknown as ExtensionAPI;
 
-    // Re-register to ensure clean test state.
     clargExtension(pi);
   });
 
-  function makeCtx(overrides: Partial<any> = {}) {
+  function makeCtx() {
     return {
       cwd: PROJECT_ROOT,
       sessionManager: { getSessionFile: () => null },
@@ -489,45 +488,56 @@ describe("extension factory — /clarg toggle", () => {
           notifyCalls.push({ msg, level });
         },
       },
-      ...overrides,
     };
   }
 
-  it("toggles on→off→on", async () => {
-    const handler = (pi as any)._commandHandler as
-      | ((_args: string, ctx: any) => Promise<void>)
-      | undefined;
+  it("/clarg-off disables guardrails", async () => {
+    const handler = commands.get("clarg-off");
     expect(handler).toBeDefined();
-
     const ctx = makeCtx();
-
-    // First toggle: on → off
     await handler!("", ctx);
     expect(notifyCalls[0].msg).toContain("OFF");
     expect(notifyCalls[0].level).toBe("warning");
+  });
 
-    // Second toggle: off → on
-    await handler!("", ctx);
-    expect(notifyCalls[1].msg).toContain("ON");
-    expect(notifyCalls[1].level).toBe("info");
+  it("/clarg-off when already off shows info", async () => {
+    // Toggle off first
+    await commands.get("clarg-off")!("", makeCtx());
+    notifyCalls.length = 0;
+    // Toggle off again
+    await commands.get("clarg-off")!("", makeCtx());
+    expect(notifyCalls[0].msg).toContain("already OFF");
+    expect(notifyCalls[0].level).toBe("info");
+  });
+
+  it("/clarg-on enables guardrails", async () => {
+    // Toggle off first
+    await commands.get("clarg-off")!("", makeCtx());
+    notifyCalls.length = 0;
+    // Toggle on
+    await commands.get("clarg-on")!("", makeCtx());
+    expect(notifyCalls[0].msg).toContain("ON");
+    expect(notifyCalls[0].level).toBe("info");
+  });
+
+  it("/clarg-on when already on shows info", async () => {
+    await commands.get("clarg-on")!("", makeCtx());
+    expect(notifyCalls[0].msg).toContain("already ON");
   });
 
   it("when disabled, tool_call handler returns early", async () => {
-    const handler = (pi as any)._commandHandler as
-      | ((_args: string, ctx: any) => Promise<void>)
-      | undefined;
-    const ctx = makeCtx();
-    // Toggle off
-    await handler!("", ctx);
-
+    await commands.get("clarg-off")!("", makeCtx());
     const toolHandler = toolCallHandlers[0];
     const event = {
       toolName: "bash",
       toolCallId: "test-1",
       input: { command: "rm -rf /" },
     };
-    const result = await toolHandler(event, ctx);
-    // Should return undefined (not blocked) because guard is off.
+    const result = await toolHandler(event, {
+      cwd: PROJECT_ROOT,
+      sessionManager: { getSessionFile: () => null },
+      ui: { notify: vi.fn() },
+    });
     expect(result).toBeUndefined();
   });
 });

@@ -5,7 +5,7 @@
  * that match `block_access_to`, `commands_forbidden`, or `special_flags`
  * patterns in `.claude/clarg-default.yaml`.
  *
- * /clarg — toggle guardrails on/off (instant, in-memory)
+ * /clarg-on / /clarg-off — instant on/off (in-memory)
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -160,15 +160,28 @@ export function buildHookInput(
 // ── extension ────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI): void {
-  // /clarg — instant toggle
-  pi.registerCommand("clarg", {
-    description: "Toggle clarg guardrails on/off",
+  // /clarg-on / /clarg-off — instant toggle
+  pi.registerCommand("clarg-on", {
+    description: "Enable clarg guardrails",
     handler: async (_args, ctx) => {
-      enabled = !enabled;
-      ctx.ui.notify(
-        `clarg guardrails ${enabled ? "ON" : "OFF"}`,
-        enabled ? "info" : "warning",
-      );
+      if (enabled) {
+        ctx.ui.notify("clarg guardrails are already ON", "info");
+        return;
+      }
+      enabled = true;
+      ctx.ui.notify("clarg guardrails ON", "info");
+    },
+  });
+
+  pi.registerCommand("clarg-off", {
+    description: "Disable clarg guardrails",
+    handler: async (_args, ctx) => {
+      if (!enabled) {
+        ctx.ui.notify("clarg guardrails are already OFF", "info");
+        return;
+      }
+      enabled = false;
+      ctx.ui.notify("clarg guardrails OFF", "warning");
     },
   });
 
