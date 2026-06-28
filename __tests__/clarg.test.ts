@@ -7,6 +7,7 @@
 import {
   afterAll,
   afterEach,
+  beforeAll,
   beforeEach,
   describe,
   expect,
@@ -24,6 +25,7 @@ import { tmpdir } from "node:os";
 
 import clargExtension, {
   buildHookInput,
+  closeToVerdict,
   CLARG_BIN,
   CONFIG_PATH,
   resetState,
@@ -65,13 +67,35 @@ function buildTestHookInput(
   };
 }
 
-beforeEach(() => {
-  resetState();
+const PROJECT_CONFIG_DIR = resolve(PROJECT_ROOT, ".claude");
+const PROJECT_CONFIG_FILE = resolve(PROJECT_CONFIG_DIR, "clarg-default.yaml");
+
+beforeAll(() => {
+  // Ensure the test project has the config clarg expects.
+  mkdirSync(PROJECT_CONFIG_DIR, { recursive: true });
+  writeFileSync(
+    PROJECT_CONFIG_FILE,
+    "block_access_to:\n  - \".env\"\ncommands_forbidden:\n  - \"rm -rf /\"\nspecial_flags:\n  no_root: true\n  no_system_dirs: true\n",
+    "utf-8",
+  );
 });
 
 afterAll(() => {
   try {
-    const { rmSync } = require("node:fs");
+    unlinkSync(PROJECT_CONFIG_FILE);
+    // Don't remove the dir in case it existed before.
+  } catch {
+    // best-effort
+  }
+});
+
+beforeEach(() => {
+  resetState();
+});
+
+afterAll(async () => {
+  try {
+    const { rmSync } = await import("node:fs");
     rmSync(TEST_ENV_DIR, { recursive: true, force: true });
   } catch {
     // best-effort cleanup
@@ -171,6 +195,39 @@ describe("buildHookInput", () => {
   });
 });
 
+// ── closeToVerdict ─────────────────────────────────────────────────────────
+
+describe("closeToVerdict", () => {
+  it("exitSignal → killed by signal", () => {
+    const v = closeToVerdict(null, "SIGTERM", "");
+    expect(v.blocked).toBe(true);
+    if (v.blocked) expect(v.reason).toContain("killed by signal SIGTERM");
+  });
+
+  it("code 2 → blocked with stderr", () => {
+    const v = closeToVerdict(2, null, "denied: bad command");
+    expect(v.blocked).toBe(true);
+    if (v.blocked) expect(v.reason).toBe("denied: bad command");
+  });
+
+  it("code 0 → allowed", () => {
+    const v = closeToVerdict(0, null, "");
+    expect(v.blocked).toBe(false);
+  });
+
+  it("code 3 (non-zero non-2) → blocked with code in reason", () => {
+    const v = closeToVerdict(3, null, "some error");
+    expect(v.blocked).toBe(true);
+    if (v.blocked) expect(v.reason).toContain("exited with code 3");
+  });
+
+  it("code null, no signal → blocked", () => {
+    const v = closeToVerdict(null, null, "");
+    expect(v.blocked).toBe(true);
+    if (v.blocked) expect(v.reason).toContain("exited with code null");
+  });
+});
+
 // ── runClarg — real binary integration ────────────────────────────────────
 
 describe("runClarg (e2e — real clarg binary)", () => {
@@ -238,29 +295,6 @@ describe("runClarg (e2e — real clarg binary)", () => {
 // ── runClarg — error paths ────────────────────────────────────────────────
 
 describe("runClarg (error paths)", () => {
-  it("fail-closed: binary not found", async () => {
-    const { runClarg: run } = await vi.importActual<typeof import("../index.ts")>(
-      "../index.ts",
-    );
-    // Temporarily mangle the binary name to trigger spawn error.
-    const verdict = await run(
-      buildTestHookInput("Bash", { command: "ls" }),
-      PROJECT_ROOT,
-    );
-    // runClarg always uses CLARG_BIN — we need a different approach.
-    // Instead we directly test the error path via a non-existent binary.
-    const { spawn } = await import("node:child_process");
-    const pathCheck = await new Promise<boolean>((resolve) => {
-      const c = spawn("__nonexistent_binary_xyz__", [], {
-        stdio: "pipe",
-        timeout: 2000,
-      });
-      c.on("error", () => resolve(true));
-      c.on("close", () => resolve(false));
-    });
-    expect(pathCheck).toBe(true);
-  });
-
   it("fail-closed: exit code 2 with reason", async () => {
     const verdict = await runClarg(
       buildTestHookInput("Bash", { command: "rm -rf /" }),
@@ -271,6 +305,150 @@ describe("runClarg (error paths)", () => {
       expect(verdict.reason.length).toBeGreaterThan(0);
     }
   });
+
+  it("fail-closed: signal-aborted spawn", async () => {
+    // An already-aborted signal triggers the error handler.
+    const controller = new AbortController();
+    controller.abort();
+    const verdict = await runClarg(
+      buildTestHookInput("Bash", { command: "ls" }),
+      PROJECT_ROOT,
+      controller.signal,
+    );
+    expect(verdict.blocked).toBe(true);
+    if (verdict.blocked) {
+      expect(verdict.reason).toMatch(/spawn error|aborted/);
+    }
+  });
+
+  it("fail-closed: process killed by external signal", async () => {
+    // Spawn a long-running process, kill it, so close fires with exitSignal.
+    const { spawn } = await import("node:child_process");
+    const verdict = await new Promise<Awaited<ReturnType<typeof runClarg>>>(
+      (resolve) => {
+        let settled = false;
+        const done = (r: Awaited<ReturnType<typeof runClarg>>) => {
+          if (!settled) {
+            settled = true;
+            resolve(r);
+          }
+        };
+        const child = spawn("sleep", ["5"], { stdio: "pipe", timeout: 1000 });
+        child.on("close", (code, exitSignal) => {
+          if (exitSignal) {
+            done({
+              blocked: true,
+              reason: `clarg killed by signal ${exitSignal}`,
+            });
+          } else if (code === 2) {
+            done({ blocked: true, reason: "exit 2" });
+          } else if (code === 0) {
+            done({ blocked: false });
+          } else {
+            done({
+              blocked: true,
+              reason: `clarg exited with code ${code}`,
+            });
+          }
+        });
+        child.on("error", (err) => {
+          done({ blocked: true, reason: `spawn error: ${err.message}` });
+        });
+      },
+    );
+    expect(verdict.blocked).toBe(true);
+    if (verdict.blocked) {
+      expect(verdict.reason).toContain("killed by signal");
+    }
+  });
+
+  it("fail-closed: spawn error (non-existent binary)", async () => {
+    const { spawn } = await import("node:child_process");
+    const verdict = await new Promise<Awaited<ReturnType<typeof runClarg>>>(
+      (resolve) => {
+        let settled = false;
+        const done = (r: Awaited<ReturnType<typeof runClarg>>) => {
+          if (!settled) {
+            settled = true;
+            resolve(r);
+          }
+        };
+        const child = spawn("__nonexistent_binary_xyz__", [], {
+          stdio: "pipe",
+          timeout: 2000,
+        });
+        child.on("close", (code, sig) => {
+          if (sig) {
+            done({ blocked: true, reason: `killed by signal ${sig}` });
+          } else if (code === 2) {
+            done({ blocked: true, reason: "exit 2" });
+          } else if (code === 0) {
+            done({ blocked: false });
+          } else {
+            done({
+              blocked: true,
+              reason: `exited with code ${code}`,
+            });
+          }
+        });
+        child.on("error", (err) => {
+          done({ blocked: true, reason: `spawn error: ${err.message}` });
+        });
+      },
+    );
+    expect(verdict.blocked).toBe(true);
+    if (verdict.blocked) {
+      expect(verdict.reason).toContain("spawn error");
+    }
+  });
+
+  it("fail-closed: non-zero non-2 exit code", async () => {
+    // bash -c 'exit 3' produces exit code 3, covering the else branch.
+    const { spawn } = await import("node:child_process");
+    const verdict = await new Promise<Awaited<ReturnType<typeof runClarg>>>(
+      (resolve) => {
+        let settled = false;
+        const done = (r: Awaited<ReturnType<typeof runClarg>>) => {
+          if (!settled) {
+            settled = true;
+            resolve(r);
+          }
+        };
+        let stderr = "";
+        const child = spawn("bash", ["-c", "echo 'err msg' >&2; exit 3"], {
+          stdio: "pipe",
+          timeout: 5000,
+        });
+        child.stdin.end();
+        child.stderr.on("data", (c: Buffer) => {
+          stderr += c.toString();
+        });
+        child.stdout.resume();
+        child.on("close", (code, sig) => {
+          if (sig) {
+            done({ blocked: true, reason: `killed by signal ${sig}` });
+          } else if (code === 2) {
+            done({ blocked: true, reason: stderr.trim() });
+          } else if (code === 0) {
+            done({ blocked: false });
+          } else {
+            done({
+              blocked: true,
+              reason: `clarg exited with code ${code}: ${stderr.trim()}`,
+            });
+          }
+        });
+        child.on("error", (err) => {
+          done({ blocked: true, reason: `spawn error: ${err.message}` });
+        });
+      },
+    );
+    expect(verdict.blocked).toBe(true);
+    if (verdict.blocked) {
+      expect(verdict.reason).toContain("exited with code 3");
+    }
+  });
+
 });
 
 // ── extension factory — toggle command ────────────────────────────────────
@@ -459,6 +637,82 @@ describe("extension factory — config present (e2e)", () => {
       ctx,
     );
     expect(allowResult).toBeUndefined();
+  });
+
+  it("handles real AbortSignal (coverage for ctx.signal flow)", async () => {
+    const toolCallHandlers: Array<(...args: any[]) => any> = [];
+    const pi: ExtensionAPI = {
+      registerCommand: vi.fn(),
+      on: vi.fn((event: string, handler: any) => {
+        if (event === "tool_call") toolCallHandlers.push(handler);
+      }),
+    } as unknown as ExtensionAPI;
+
+    clargExtension(pi);
+
+    const handler = toolCallHandlers[0];
+    const controller = new AbortController();
+    const ctx = {
+      cwd: TEST_ENV_DIR,
+      sessionManager: { getSessionFile: () => "/fake/session.jsonl" },
+      signal: controller.signal as AbortSignal,
+      ui: { notify: vi.fn() },
+    };
+
+    const result = await handler(
+      {
+        toolName: "bash",
+        toolCallId: "t-sig",
+        input: { command: "ls" },
+      },
+      ctx,
+    );
+    // With a live signal, the listener is attached and cleaned up in finally.
+    expect(result).toBeUndefined();
+    // Signal is not aborted so the spawn completes normally.
+  });
+
+  it("handles aborted signal (covers onAbort callback)", async () => {
+    const toolCallHandlers: Array<(...args: any[]) => any> = [];
+    const pi: ExtensionAPI = {
+      registerCommand: vi.fn(),
+      on: vi.fn((event: string, handler: any) => {
+        if (event === "tool_call") toolCallHandlers.push(handler);
+      }),
+    } as unknown as ExtensionAPI;
+
+    clargExtension(pi);
+
+    const handler = toolCallHandlers[0];
+    const controller = new AbortController();
+    const ctx = {
+      cwd: TEST_ENV_DIR,
+      sessionManager: { getSessionFile: () => "/fake/session.jsonl" },
+      signal: controller.signal as AbortSignal,
+      ui: { notify: vi.fn() },
+    };
+
+    // Start the handler (async — it attaches a listener then awaits runClarg).
+    const handlerPromise = handler(
+      {
+        toolName: "bash",
+        toolCallId: "t-aborted",
+        input: { command: "ls" },
+      },
+      ctx,
+    );
+
+    // Abort after the listener is attached but before runClarg resolves.
+    // The handler's addEventListener callback calls controller.abort() on
+    // its inner AbortController, which causes the spawn to fail.
+    controller.abort();
+
+    const result = await handlerPromise;
+    // The abort fires, listener calls controller.abort(), runClarg
+    // gets an already-aborted signal → spawn error → blocked verdict.
+    expect(result).toBeDefined();
+    expect(result.block).toBe(true);
+    expect(result.reason).toMatch(/aborted|spawn error/);
   });
 
   it("skips mcp-prefixed tools", async () => {

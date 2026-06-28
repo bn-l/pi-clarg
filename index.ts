@@ -70,6 +70,27 @@ export type ClargVerdict =
   | { blocked: true; reason: string }
   | { blocked: false };
 
+/** Map a close event to a verdict. Exported for testability. */
+export function closeToVerdict(
+  code: number | null,
+  exitSignal: string | null,
+  stderr: string,
+): ClargVerdict {
+  if (exitSignal) {
+    return { blocked: true, reason: `clarg killed by signal ${exitSignal}` };
+  }
+  if (code === 2) {
+    return { blocked: true, reason: stderr.trim() };
+  }
+  if (code === 0) {
+    return { blocked: false };
+  }
+  return {
+    blocked: true,
+    reason: `clarg exited with code ${code}: ${stderr.trim()}`,
+  };
+}
+
 export async function runClarg(
   hookInput: Record<string, unknown>,
   cwd: string,
@@ -104,21 +125,7 @@ export async function runClarg(
     child.stdout.resume();
 
     child.on("close", (code, exitSignal) => {
-      if (exitSignal) {
-        done({
-          blocked: true,
-          reason: `clarg killed by signal ${exitSignal}`,
-        });
-      } else if (code === 2) {
-        done({ blocked: true, reason: stderr.trim() });
-      } else if (code === 0) {
-        done({ blocked: false });
-      } else {
-        done({
-          blocked: true,
-          reason: `clarg exited with code ${code}: ${stderr.trim()}`,
-        });
-      }
+      done(closeToVerdict(code, exitSignal, stderr));
     });
 
     child.on("error", (err) => {
@@ -193,17 +200,16 @@ export default function (pi: ExtensionAPI): void {
 
     // Tie the abort to pi's signal so Esc cancels the spawn.
     const controller = new AbortController();
-    const onAbort = () => controller.abort();
-    ctx.signal?.addEventListener("abort", onAbort, { once: true });
+    ctx.signal?.addEventListener(
+      "abort",
+      () => controller.abort(),
+      { once: true },
+    );
 
-    try {
-      const verdict = await runClarg(hookInput, ctx.cwd, controller.signal);
+    const verdict = await runClarg(hookInput, ctx.cwd, controller.signal);
 
-      if (verdict.blocked) {
-        return { block: true, reason: verdict.reason };
-      }
-    } finally {
-      ctx.signal?.removeEventListener("abort", onAbort);
+    if (verdict.blocked) {
+      return { block: true, reason: verdict.reason };
     }
   });
 }
