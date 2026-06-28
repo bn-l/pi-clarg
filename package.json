@@ -1,0 +1,41 @@
+{
+  "name": "pi-clarg",
+  "version": "0.1.0",
+  "description": "clarg guardrails for pi — Claude Code argument guard as a pi extension",
+  "type": "module",
+  "license": "MIT",
+  "author": "",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "clarg",
+    "security",
+    "guarding",
+    "coding-agent",
+    "extension"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "files": [
+    "index.ts",
+    "package.json",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.0",
+    "@types/node": "^20.0.0",
+    "@vitest/coverage-v8": "^3.0.0",
+    "vitest": "^3.0.0"
+  }
+}
